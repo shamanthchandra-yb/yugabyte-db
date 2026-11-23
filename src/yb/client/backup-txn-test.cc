@@ -60,6 +60,10 @@ DECLARE_bool(allow_encryption_at_rest);
 DECLARE_bool(TEST_disable_apply_committed_transactions);
 DECLARE_bool(TEST_pause_restore_after_ddl_verification_check);
 DECLARE_int64(max_concurrent_snapshot_rpcs);
+DECLARE_bool(enable_automatic_tablet_splitting);
+DECLARE_int64(tablet_split_low_phase_shard_count_per_node);
+DECLARE_int64(tablet_split_low_phase_size_threshold_bytes);
+DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
 DECLARE_uint64(transaction_resend_applying_interval_usec);
 
 namespace yb {
@@ -126,11 +130,13 @@ class BackupTxnTest : public TransactionTestBase<MiniCluster> {
   void TestDeleteSnapshot(bool compact_and_restart);
   void TestLargeTransactionApplyingOnFollower(ShutdownFollower shutdown_follower);
   void TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits split);
+  void TestPeriodicSnapshotOvertakenByAutomaticSplit(SplitWhileSnapshotWaits split);
 
   // SnapshotTestUtil::RestoreSnapshotSchedule uses a 60 s RPC timeout, and the master waits within
   // that RPC for the snapshot it creates for the restore.
   Status RestoreScheduleWithLongTimeout(
-      const SnapshotScheduleId& schedule_id, HybridTime restore_at) {
+      const SnapshotScheduleId& schedule_id, HybridTime restore_at,
+      TxnSnapshotId* used_snapshot_id = nullptr) {
     master::RestoreSnapshotScheduleRequestPB req;
     master::RestoreSnapshotScheduleResponsePB resp;
     rpc::RpcController controller;
@@ -141,6 +147,9 @@ class BackupTxnTest : public TransactionTestBase<MiniCluster> {
         .RestoreSnapshotSchedule(req, &resp, &controller));
     if (resp.has_error()) {
       return StatusFromPB(resp.error().status());
+    }
+    if (used_snapshot_id) {
+      *used_snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(resp.snapshot_id()));
     }
     auto restoration_id = VERIFY_RESULT(
         FullyDecodeTxnSnapshotRestorationId(resp.restoration_id()));
@@ -780,6 +789,169 @@ TEST_F(BackupTxnTest, SnapshotOvertakenBySplit) {
 // Control: the same without the split.
 TEST_F(BackupTxnTest, SnapshotWaitsForApplyWithoutSplit) {
   TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits::kFalse);
+}
+
+// A PITR restore (or a DB clone) to a time that an existing schedule snapshot covers reuses that
+// snapshot (FindSnapshotSuitableForRestoreAt). Only the snapshot a restore creates for itself is
+// taken with automatic splitting paused (PrepareForSnapshotRestore); the schedule's periodic
+// snapshots are not. So an automatic split can overtake a periodic snapshot the same way as in
+// TestSnapshotOvertakenBySplit, and a later restore to a time before that snapshot restores the
+// split parent without T.
+// split == kFalse is the control: automatic splitting stays off.
+void BackupTxnTest::TestPeriodicSnapshotOvertakenByAutomaticSplit(SplitWhileSnapshotWaits split) {
+  constexpr int kNumEarlyRows = 100;
+  constexpr int kLateKeyBase = 100000;
+  constexpr int kNumLateRows = 100;
+  const auto kInterval = 30s;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_resend_applying_interval_usec) = 1000000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_concurrent_snapshot_rpcs) = 0;
+  // Any tablet with SST files is an automatic split candidate once splitting is enabled.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_split_low_phase_size_threshold_bytes) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_split_low_phase_shard_count_per_node) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+  google::SetVLOGLevel("transaction_participant", 4);
+
+  // The schedule takes its first snapshot now and the next one kInterval later, after T commits.
+  auto schedule_id = ASSERT_RESULT(snapshot_util_->CreateSchedule(
+      table_, kTableName.namespace_type(), kTableName.namespace_name(), WaitSnapshot::kTrue,
+      MonoDelta(kInterval), MonoDelta(20h)));
+
+  auto write_rows = [this](int key_base, int num_rows) -> Result<TransactionId> {
+    auto txn = CreateTransaction();
+    auto session = CreateSession(txn);
+    for (int i = 0; i != num_rows; ++i) {
+      RETURN_NOT_OK(WriteRow(
+          session, key_base + i, key_base + i, WriteOpType::INSERT, Flush::kFalse));
+    }
+    RETURN_NOT_OK(session->TEST_Flush());
+    RETURN_NOT_OK(txn->CommitFuture().get());
+    return txn->id();
+  };
+  auto count_rows = [this](int key_base, int num_rows) -> Result<int> {
+    auto session = CreateSession();
+    int result = 0;
+    for (int i = 0; i != num_rows; ++i) {
+      auto value = SelectRow(session, key_base + i);
+      if (value.ok()) {
+        ++result;
+      } else if (!value.status().IsNotFound()) {
+        return value.status();
+      }
+    }
+    return result;
+  };
+  auto schedule_snapshots = [this, &schedule_id]() -> Result<std::vector<master::SnapshotInfoPB>> {
+    std::vector<master::SnapshotInfoPB> result;
+    for (const auto& snapshot : VERIFY_RESULT(snapshot_util_->ListSnapshots())) {
+      if (TryFullyDecodeSnapshotScheduleId(snapshot.entry().schedule_id()) == schedule_id) {
+        result.push_back(snapshot);
+      }
+    }
+    return result;
+  };
+
+  ASSERT_RESULT(write_rows(0, kNumEarlyRows));
+  ASSERT_OK(WaitForTableIntentsApplied(cluster_.get(), table_->id(), kWaitTimeout));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = true;
+  const auto late_txn_id = ASSERT_RESULT(write_rows(kLateKeyBase, kNumLateRows));
+  // The restore target: after T committed, before the next periodic snapshot.
+  const auto restore_at = cluster_->mini_tablet_server(0)->server()->Clock()->Now();
+  LOG(INFO) << "Late transaction committed: " << late_txn_id << ", restore_at: " << restore_at;
+  ASSERT_EQ(ASSERT_RESULT(schedule_snapshots()).size(), 1)
+      << "The periodic snapshot started before T committed";
+
+  TabletId split_tablet_id;
+  for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_->id())) {
+    auto tablet = ASSERT_RESULT(peer->shared_tablet());
+    if (tablet->transaction_participant()->GetNumRunningTransactions() != 0) {
+      split_tablet_id = peer->tablet_id();
+      break;
+    }
+  }
+  ASSERT_FALSE(split_tablet_id.empty());
+
+  // The periodic snapshot reaches the tablet, whose leader then waits for T's APPLY.
+  StringWaiterLogSink snapshot_op_started(
+      "Processing TabletSnapshotOp for tablet " + split_tablet_id);
+  ASSERT_OK(snapshot_op_started.WaitFor(kInterval * 2 * kTimeMultiplier));
+  LOG(INFO) << "Periodic snapshot is waiting on " << split_tablet_id;
+  SleepFor(1s * kTimeMultiplier);
+  if (split) {
+    LOG(INFO) << "Enabling automatic splitting";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = true;
+    ASSERT_OK(WaitFor([&]() -> Result<bool> {
+      for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_->id())) {
+        if (peer->tablet_id() == split_tablet_id) {
+          return false;
+        }
+      }
+      return true;
+    }, 120s * kTimeMultiplier, "Automatic split of the waiting tablet"));
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+    LOG(INFO) << "Automatic split of " << split_tablet_id << " applied, splitting disabled";
+  }
+  LOG(INFO) << "Enabling APPLY";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = false;
+
+  // The periodic snapshot completes.
+  TxnSnapshotId periodic_snapshot_id = TxnSnapshotId::Nil();
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    for (const auto& snapshot : VERIFY_RESULT(schedule_snapshots())) {
+      if (HybridTime::FromPB(snapshot.entry().snapshot_hybrid_time()) >= restore_at &&
+          snapshot.entry().state() == SysSnapshotEntryPB::COMPLETE) {
+        periodic_snapshot_id = VERIFY_RESULT(FullyDecodeTxnSnapshotId(snapshot.id()));
+        return true;
+      }
+    }
+    return false;
+  }, 240s * kTimeMultiplier, "Periodic snapshot complete"));
+  LOG(INFO) << "Periodic snapshot complete: " << periodic_snapshot_id;
+
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    return VERIFY_RESULT(count_rows(kLateKeyBase, kNumLateRows)) == kNumLateRows;
+  }, 60s * kTimeMultiplier, "Live data has the late transaction"));
+  LOG(INFO) << "Live data before the restore: " << kNumLateRows << " of " << kNumLateRows
+            << " rows of " << late_txn_id;
+  // As a real restore would be, run it after T is done everywhere. Until then the coordinator still
+  // answers COMMITTED for T, and reads of the restored parent resolve the intents its replicas still
+  // hold. Split parents are left out: they take no more writes, so their replicas may keep T.
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    for (const auto& peer : ListTableActiveTabletPeers(cluster_.get(), table_->id())) {
+      auto tablet = VERIFY_RESULT(peer->shared_tablet());
+      if (tablet->transaction_participant()->GetNumRunningTransactions() != 0) {
+        return false;
+      }
+    }
+    return true;
+  }, 60s * kTimeMultiplier, "T done on all active tablets"));
+  LOG(INFO) << "T done on all active tablets";
+
+  TxnSnapshotId used_snapshot_id = TxnSnapshotId::Nil();
+  ASSERT_OK(RestoreScheduleWithLongTimeout(schedule_id, restore_at, &used_snapshot_id));
+  LOG(INFO) << "Restore to " << restore_at << " used snapshot " << used_snapshot_id;
+  ASSERT_EQ(used_snapshot_id, periodic_snapshot_id)
+      << "The restore did not reuse the periodic snapshot";
+
+  const auto early_rows = ASSERT_RESULT(count_rows(0, kNumEarlyRows));
+  const auto late_rows = ASSERT_RESULT(count_rows(kLateKeyBase, kNumLateRows));
+  LOG(INFO) << "Restored: " << early_rows << " of " << kNumEarlyRows << " earlier rows, "
+            << late_rows << " of " << kNumLateRows << " rows of " << late_txn_id;
+  ASSERT_EQ(early_rows, kNumEarlyRows);
+  ASSERT_EQ(late_rows, kNumLateRows)
+      << "Restore to a time after the commit lost rows of " << late_txn_id;
+}
+
+TEST_F(BackupTxnTest, PeriodicSnapshotOvertakenByAutomaticSplit) {
+  TestPeriodicSnapshotOvertakenByAutomaticSplit(SplitWhileSnapshotWaits::kTrue);
+}
+
+// Control: the same with automatic splitting off.
+TEST_F(BackupTxnTest, PeriodicSnapshotWaitsForApplyWithoutSplit) {
+  TestPeriodicSnapshotOvertakenByAutomaticSplit(SplitWhileSnapshotWaits::kFalse);
 }
 
 void BackupTxnTest::TestDeleteTable(bool restart_masters) {
