@@ -19,8 +19,11 @@
 #include "yb/client/yb_table_name.h"
 
 #include "yb/common/transaction_error.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/master/master_backup.proxy.h"
+
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/rocksdb/db.h"
 
@@ -28,6 +31,7 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_retention_policy.h"
 #include "yb/tablet/tablet_snapshots.h"
+#include "yb/tablet/transaction_participant.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
@@ -53,6 +57,10 @@ DECLARE_uint64(max_clock_skew_usec);
 DECLARE_uint64(snapshot_coordinator_cleanup_delay_ms);
 DECLARE_uint64(snapshot_coordinator_poll_interval_ms);
 DECLARE_bool(allow_encryption_at_rest);
+DECLARE_bool(TEST_disable_apply_committed_transactions);
+DECLARE_bool(TEST_pause_restore_after_ddl_verification_check);
+DECLARE_int64(max_concurrent_snapshot_rpcs);
+DECLARE_uint64(transaction_resend_applying_interval_usec);
 
 namespace yb {
 namespace client {
@@ -61,6 +69,7 @@ using ImportedSnapshotData = google::protobuf::RepeatedPtrField<
     master::ImportSnapshotMetaResponsePB::TableMetaPB>;
 
 YB_STRONGLY_TYPED_BOOL(ShutdownFollower);
+YB_STRONGLY_TYPED_BOOL(SplitWhileSnapshotWaits);
 
 class BackupTxnTest : public TransactionTestBase<MiniCluster> {
  protected:
@@ -116,6 +125,28 @@ class BackupTxnTest : public TransactionTestBase<MiniCluster> {
   void TestDeleteTable(bool restart_masters);
   void TestDeleteSnapshot(bool compact_and_restart);
   void TestLargeTransactionApplyingOnFollower(ShutdownFollower shutdown_follower);
+  void TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits split);
+
+  // SnapshotTestUtil::RestoreSnapshotSchedule uses a 60 s RPC timeout, and the master waits within
+  // that RPC for the snapshot it creates for the restore.
+  Status RestoreScheduleWithLongTimeout(
+      const SnapshotScheduleId& schedule_id, HybridTime restore_at) {
+    master::RestoreSnapshotScheduleRequestPB req;
+    master::RestoreSnapshotScheduleResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(300s * kTimeMultiplier);
+    req.set_snapshot_schedule_id(schedule_id.data(), schedule_id.size());
+    req.set_restore_ht(restore_at.ToUint64());
+    RETURN_NOT_OK(VERIFY_RESULT(snapshot_util_->MakeBackupServiceProxy())
+        .RestoreSnapshotSchedule(req, &resp, &controller));
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    auto restoration_id = VERIFY_RESULT(
+        FullyDecodeTxnSnapshotRestorationId(resp.restoration_id()));
+    return snapshot_util_->WaitRestorationInState(
+        restoration_id, master::SysSnapshotEntryPB::RESTORED, 120s * kTimeMultiplier);
+  }
 
   std::unique_ptr<SnapshotTestUtil> snapshot_util_;
 };
@@ -614,6 +645,141 @@ TEST_F(BackupTxnTest, LargeTransactionApplyingOnFollower) {
 // The follower postpones the snapshot operation, so its shutdown does not wait for the apply.
 TEST_F(BackupTxnTest, ShutdownFollowerPostponingSnapshot) {
   TestLargeTransactionApplyingOnFollower(ShutdownFollower::kTrue);
+}
+
+// The leader of a tablet waits in ResolveIntents, before submitting the snapshot operation, for the
+// APPLY of a transaction T committed at or before the snapshot hybrid time. A split of that tablet
+// can overtake the snapshot operation:
+// 1. The leader waits for T's APPLY. The master re-sends the snapshot RPC when it times out.
+// 2. The tablet splits. The coordinator sends T's APPLY to the children, they apply it, and the
+//    coordinator removes T.
+// 3. A later attempt on the split parent asks the coordinator for T's status. T is unknown there,
+//    so the answer is ABORTED: the participant drops T and the snapshot operation goes into the
+//    parent's log after the split operation.
+// 4. The parent's checkpoint is its frozen data, which never got T's APPLY. Restore drops intents,
+//    so the restored copy misses T on the parent's key range.
+// Seen in the stress test test_packed_row_compaction_merge_snapshot_split on 2.33.0.0-b75 (a DB
+// clone lost a committed transaction on one split parent's range).
+// split == kFalse is the control: the same steps without the split.
+void BackupTxnTest::TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits split) {
+  constexpr int kNumEarlyRows = 100;
+  constexpr int kLateKeyBase = 100000;
+  constexpr int kNumLateRows = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_resend_applying_interval_usec) = 1000000;
+  // Every tablet gets its snapshot RPC at once. By default one RPC per tserver is outstanding, and
+  // a tablet whose leader waits for T holds that slot.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_concurrent_snapshot_rpcs) = 0;
+  google::SetVLOGLevel("transaction_participant", 4);
+
+  // Under a schedule a split parent is hidden, not deleted, so PITR can restore it.
+  // Long interval: the only later snapshot is the one the restore creates.
+  auto schedule_id = ASSERT_RESULT(snapshot_util_->CreateSchedule(
+      table_, kTableName.namespace_type(), kTableName.namespace_name(), WaitSnapshot::kTrue,
+      MonoDelta(1h), MonoDelta(20h)));
+
+  auto write_rows = [this](int key_base, int num_rows) -> Result<TransactionId> {
+    auto txn = CreateTransaction();
+    auto session = CreateSession(txn);
+    for (int i = 0; i != num_rows; ++i) {
+      RETURN_NOT_OK(WriteRow(
+          session, key_base + i, key_base + i, WriteOpType::INSERT, Flush::kFalse));
+    }
+    RETURN_NOT_OK(session->TEST_Flush());
+    RETURN_NOT_OK(txn->CommitFuture().get());
+    return txn->id();
+  };
+  // Point reads: SelectAllRows uses the table handle's partitions, which a split makes stale.
+  auto count_rows = [this](int key_base, int num_rows) -> Result<int> {
+    auto session = CreateSession();
+    int result = 0;
+    for (int i = 0; i != num_rows; ++i) {
+      auto value = SelectRow(session, key_base + i);
+      if (value.ok()) {
+        ++result;
+      } else if (!value.status().IsNotFound()) {
+        return value.status();
+      }
+    }
+    return result;
+  };
+
+  // Rows in regular DB, so the tablet has a split key.
+  ASSERT_RESULT(write_rows(0, kNumEarlyRows));
+  ASSERT_OK(WaitForTableIntentsApplied(cluster_.get(), table_->id(), kWaitTimeout));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  // T commits, but its participants do not get APPLY yet.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = true;
+  const auto late_txn_id = ASSERT_RESULT(write_rows(kLateKeyBase, kNumLateRows));
+  LOG(INFO) << "Late transaction committed: " << late_txn_id;
+
+  // The tablet to split: one with T's intents.
+  TabletId split_tablet_id;
+  for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_->id())) {
+    auto tablet = ASSERT_RESULT(peer->shared_tablet());
+    if (tablet->transaction_participant()->GetNumRunningTransactions() != 0) {
+      split_tablet_id = peer->tablet_id();
+      break;
+    }
+  }
+  ASSERT_FALSE(split_tablet_id.empty());
+  const auto num_tablets = ListTableActiveTabletLeadersPeers(cluster_.get(), table_->id()).size();
+
+  // Restore to a time after T committed. The master creates the snapshot the restore needs, and
+  // pauses once that snapshot is complete, before restoring.
+  const auto restore_at = cluster_->mini_tablet_server(0)->server()->Clock()->Now();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_restore_after_ddl_verification_check) = true;
+  StringWaiterLogSink restore_paused(
+      "Pausing due to flag TEST_pause_restore_after_ddl_verification_check");
+  StringWaiterLogSink snapshot_op_started(
+      "Processing TabletSnapshotOp for tablet " + split_tablet_id);
+  TestThreadHolder thread_holder;
+  Status restore_status;
+  thread_holder.AddThreadFunctor([this, &schedule_id, restore_at, &restore_status] {
+    restore_status = RestoreScheduleWithLongTimeout(schedule_id, restore_at);
+  });
+
+  // The leader of the tablet now waits in ResolveIntents for T's APPLY.
+  ASSERT_OK(snapshot_op_started.WaitFor(60s * kTimeMultiplier));
+  SleepFor(1s * kTimeMultiplier);
+  if (split) {
+    LOG(INFO) << "Splitting " << split_tablet_id << " while its snapshot operation waits";
+    ASSERT_OK(InvokeSplitTabletRpc(cluster_.get(), split_tablet_id));
+    ASSERT_OK(ResultToStatus(WaitForTableActiveTabletLeadersPeers(
+        cluster_.get(), table_->id(), num_tablets + 1)));
+    LOG(INFO) << "Split children have leaders";
+  }
+  LOG(INFO) << "Enabling APPLY";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = false;
+
+  // The snapshot is complete and the restore has not started: live data has every row of T.
+  ASSERT_OK(restore_paused.WaitFor(240s * kTimeMultiplier));
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    return VERIFY_RESULT(count_rows(kLateKeyBase, kNumLateRows)) == kNumLateRows;
+  }, 60s * kTimeMultiplier, "Live data has the late transaction"));
+  LOG(INFO) << "Live data before the restore: " << kNumLateRows << " of " << kNumLateRows
+            << " rows of " << late_txn_id;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_restore_after_ddl_verification_check) = false;
+  thread_holder.JoinAll();
+  ASSERT_OK(restore_status);
+
+  const auto early_rows = ASSERT_RESULT(count_rows(0, kNumEarlyRows));
+  const auto late_rows = ASSERT_RESULT(count_rows(kLateKeyBase, kNumLateRows));
+  LOG(INFO) << "Restored: " << early_rows << " of " << kNumEarlyRows << " earlier rows, "
+            << late_rows << " of " << kNumLateRows << " rows of " << late_txn_id;
+  ASSERT_EQ(early_rows, kNumEarlyRows);
+  ASSERT_EQ(late_rows, kNumLateRows)
+      << "Restore to a time after the commit lost rows of " << late_txn_id;
+}
+
+TEST_F(BackupTxnTest, SnapshotOvertakenBySplit) {
+  TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits::kTrue);
+}
+
+// Control: the same without the split.
+TEST_F(BackupTxnTest, SnapshotWaitsForApplyWithoutSplit) {
+  TestSnapshotOvertakenBySplit(SplitWhileSnapshotWaits::kFalse);
 }
 
 void BackupTxnTest::TestDeleteTable(bool restart_masters) {
