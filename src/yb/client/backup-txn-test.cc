@@ -53,6 +53,9 @@ DECLARE_uint64(max_clock_skew_usec);
 DECLARE_uint64(snapshot_coordinator_cleanup_delay_ms);
 DECLARE_uint64(snapshot_coordinator_poll_interval_ms);
 DECLARE_bool(allow_encryption_at_rest);
+DECLARE_bool(TEST_disable_apply_committed_transactions);
+DECLARE_int64(max_concurrent_snapshot_rpcs);
+DECLARE_uint64(transaction_resend_applying_interval_usec);
 
 namespace yb {
 namespace client {
@@ -61,6 +64,7 @@ using ImportedSnapshotData = google::protobuf::RepeatedPtrField<
     master::ImportSnapshotMetaResponsePB::TableMetaPB>;
 
 YB_STRONGLY_TYPED_BOOL(ShutdownFollower);
+YB_STRONGLY_TYPED_BOOL(PropagateHistoryCutoff);
 
 class BackupTxnTest : public TransactionTestBase<MiniCluster> {
  protected:
@@ -116,6 +120,7 @@ class BackupTxnTest : public TransactionTestBase<MiniCluster> {
   void TestDeleteTable(bool restart_masters);
   void TestDeleteSnapshot(bool compact_and_restart);
   void TestLargeTransactionApplyingOnFollower(ShutdownFollower shutdown_follower);
+  void TestFollowerCompactsPastSnapshotTime(PropagateHistoryCutoff propagate);
 
   std::unique_ptr<SnapshotTestUtil> snapshot_util_;
 };
@@ -615,6 +620,146 @@ TEST_F(BackupTxnTest, LargeTransactionApplyingOnFollower) {
 TEST_F(BackupTxnTest, ShutdownFollowerPostponingSnapshot) {
   TestLargeTransactionApplyingOnFollower(ShutdownFollower::kTrue);
 }
+
+// TabletSnapshotOp registers a reader at the snapshot hybrid time S only on the leader, and only
+// until the SNAPSHOT_OP is submitted. Its comment relies on history cutoff propagation through
+// Raft to keep followers from moving their cutoff past S. With
+// enable_history_cutoff_propagation=false (the default) each follower computes its cutoff from its
+// own clock, and a snapshot without a schedule does not clamp it. So when the leader waits in
+// ResolveIntents for longer than the retention interval, a follower can compact away the version
+// of a row visible at S before it applies the SNAPSHOT_OP, and its checkpoint lacks that row.
+// propagate == kTrue is the control.
+void BackupTxnTest::TestFollowerCompactsPastSnapshotTime(PropagateHistoryCutoff propagate) {
+  constexpr int kNumEarlyRows = 100;
+  constexpr int kOverwriteDelta = 1000000;
+  constexpr int kLateKeyBase = 100000;
+  constexpr int kNumLateRows = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_resend_applying_interval_usec) = 1000000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_concurrent_snapshot_rpcs) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_history_cutoff_propagation) = propagate.get();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_history_cutoff_propagation_interval_ms) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 1;
+  const auto kPastRetention = 3s;
+
+  auto write_rows = [this](int key_base, int num_rows) -> Result<TransactionId> {
+    auto txn = CreateTransaction();
+    auto session = CreateSession(txn);
+    for (int i = 0; i != num_rows; ++i) {
+      RETURN_NOT_OK(WriteRow(
+          session, key_base + i, key_base + i, WriteOpType::INSERT, Flush::kFalse));
+    }
+    RETURN_NOT_OK(session->TEST_Flush());
+    RETURN_NOT_OK(txn->CommitFuture().get());
+    return txn->id();
+  };
+  struct RowCheck {
+    int expected = 0;
+    int missing = 0;
+    int other = 0;
+    std::string ToString() const { return YB_STRUCT_TO_STRING(expected, missing, other); }
+  };
+  auto check_rows = [this](int key_base, int num_rows) -> Result<RowCheck> {
+    auto session = CreateSession();
+    RowCheck result;
+    for (int i = 0; i != num_rows; ++i) {
+      auto value = SelectRow(session, key_base + i);
+      if (value.ok()) {
+        ++(*value == key_base + i ? result.expected : result.other);
+      } else if (value.status().IsNotFound()) {
+        ++result.missing;
+      } else {
+        return value.status();
+      }
+    }
+    return result;
+  };
+
+  ASSERT_RESULT(write_rows(0, kNumEarlyRows));
+  ASSERT_OK(WaitForTableIntentsApplied(cluster_.get(), table_->id(), kWaitTimeout));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  // T commits, but its participants do not get APPLY yet, so the leaders of T's tablets wait in
+  // ResolveIntents.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = true;
+  const auto late_txn_id = ASSERT_RESULT(write_rows(kLateKeyBase, kNumLateRows));
+  LOG(INFO) << "Late transaction committed: " << late_txn_id;
+
+  StringWaiterLogSink snapshot_op_started("Processing TabletSnapshotOp for tablet ");
+  auto snapshot_id = ASSERT_RESULT(snapshot_util_->StartSnapshot(table_));
+  ASSERT_OK(snapshot_op_started.WaitFor(60s * kTimeMultiplier));
+  SleepFor(kPastRetention);
+
+  // Overwrite every early row after S, outside a transaction so the writes reach regular DB.
+  {
+    auto session = CreateSession();
+    for (int i = 0; i != kNumEarlyRows; ++i) {
+      ASSERT_OK(WriteRow(session, i, i + kOverwriteDelta, WriteOpType::INSERT, Flush::kFalse));
+    }
+    ASSERT_OK(session->TEST_Flush());
+  }
+  ASSERT_RESULT(check_rows(0, kNumEarlyRows));
+  SleepFor(kPastRetention);
+  LOG(INFO) << "Compacting all replicas while the snapshot operation waits";
+  ASSERT_OK(cluster_->CompactTablets());
+  for (const auto& peer : ListTableActiveTabletPeers(cluster_.get(), table_->id())) {
+    auto tablet = ASSERT_RESULT(peer->shared_tablet());
+    LOG(INFO) << peer->LogPrefix() << "role " << AsString(peer->LeaderStatus())
+              << ", history cutoff "
+              << tablet->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+  }
+
+  LOG(INFO) << "Enabling APPLY";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = false;
+  ASSERT_OK(snapshot_util_->WaitSnapshotDone(snapshot_id, 120s * kTimeMultiplier));
+  ASSERT_OK(snapshot_util_->RestoreSnapshot(snapshot_id));
+
+  // Each replica restored its own checkpoint. Read with every tablet led from one tserver at a
+  // time, so a bad checkpoint on any replica shows up.
+  std::vector<std::string> failures;
+  const auto tablet_ids = [&] {
+    std::vector<TabletId> result;
+    for (const auto& peer : ListTableActiveTabletLeadersPeers(cluster_.get(), table_->id())) {
+      result.push_back(peer->tablet_id());
+    }
+    return result;
+  }();
+  for (size_t ts_idx = 0; ts_idx != cluster_->num_tablet_servers(); ++ts_idx) {
+    const auto ts_uuid = cluster_->mini_tablet_server(ts_idx)->server()->permanent_uuid();
+    for (const auto& tablet_id : tablet_ids) {
+      ASSERT_OK(WaitFor([&]() -> Result<bool> {
+        auto status = TransferLeadership(cluster_.get(), tablet_id, ts_uuid);
+        if (!status.ok()) {
+          LOG(INFO) << "Transfer of " << tablet_id << " to " << ts_uuid << ": " << status;
+        }
+        return status.ok();
+      }, 60s * kTimeMultiplier, "Transfer leadership"));
+    }
+    ASSERT_OK(WaitForTableLeaders(
+        cluster_.get(), table_->id(), 30s * kTimeMultiplier, RequireLeaderIsReady::kTrue));
+    const auto early = ASSERT_RESULT(check_rows(0, kNumEarlyRows));
+    const auto late = ASSERT_RESULT(check_rows(kLateKeyBase, kNumLateRows));
+    LOG(INFO) << "Restored, leaders on ts " << ts_idx << " (" << ts_uuid << "): early rows "
+              << early.ToString() << ", rows of " << late_txn_id << " " << late.ToString();
+    if (early.expected != kNumEarlyRows || late.expected != kNumLateRows) {
+      failures.push_back(Format(
+          "ts $0: early $1, late $2", ts_idx, early.ToString(), late.ToString()));
+    }
+  }
+  ASSERT_TRUE(failures.empty()) << "Restored replicas differ from the data at the snapshot time: "
+                                << AsString(failures);
+}
+
+TEST_F(BackupTxnTest, FollowerCompactsPastSnapshotTime) {
+  TestFollowerCompactsPastSnapshotTime(PropagateHistoryCutoff::kFalse);
+}
+
+// Control: with history cutoff propagation, followers take the cutoff from the leader, whose reader
+// at S holds it back.
+TEST_F(BackupTxnTest, FollowerKeepsSnapshotTimeWithCutoffPropagation) {
+  TestFollowerCompactsPastSnapshotTime(PropagateHistoryCutoff::kTrue);
+}
+
 
 void BackupTxnTest::TestDeleteTable(bool restart_masters) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_unresponsive_ts_rpc_timeout_ms) = 1000;
